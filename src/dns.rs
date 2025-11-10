@@ -90,33 +90,59 @@ pub fn udp_query_typed(domain: &str, server: &str, timeout_ms: u64) -> Result<Ve
 }
 
 pub fn udp_query_full(domain: &str, server: &str, timeout_ms: u64) -> Result<DnsAnswer> {
-    let packet = build_query(domain, trust_dns_proto::rr::RecordType::A)?;
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    sock.send_to(&packet, format!("{}:53", server))?;
-    let mut recv = [0u8; 2048];
-    match sock.recv(&mut recv) {
-        Ok(n) => {
-            let bytes = &recv[..n];
-            let msg = trust_dns_proto::op::Message::from_bytes(bytes)?;
-            let rcode = format!("{:?}", msg.response_code());
-            let mut records = Vec::new();
-            for rec in msg.answers() {
-                if let Some(data) = rec.data() {
-                    use trust_dns_proto::rr::RData;
-                    match data {
-                        RData::A(ip) => records.push(RawRecord{ rtype: "A".into(), data: ip.to_string()}),
-                        RData::AAAA(ip) => records.push(RawRecord{ rtype: "AAAA".into(), data: ip.to_string()}),
-                        RData::CNAME(c) => records.push(RawRecord{ rtype: "CNAME".into(), data: c.to_utf8()}),
-                        RData::TXT(txt) => records.push(RawRecord{ rtype: "TXT".into(), data: txt.to_string()}),
-                        _ => {}
+    // Helper to send one query of given type and parse answers
+    fn send_and_parse(domain: &str, server: &str, timeout_ms: u64, qtype: RecordType) -> Result<(Vec<RawRecord>, String)> {
+        let packet = build_query(domain, qtype)?;
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        sock.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+        sock.send_to(&packet, format!("{}:53", server))?;
+        let mut recv = [0u8; 2048];
+        match sock.recv(&mut recv) {
+            Ok(n) => {
+                let bytes = &recv[..n];
+                let msg = Message::from_bytes(bytes)?;
+                let rcode = format!("{:?}", msg.response_code());
+                let mut records = Vec::new();
+                for rec in msg.answers() {
+                    if let Some(data) = rec.data() {
+                        use trust_dns_proto::rr::RData;
+                        match data {
+                            RData::A(ip) => records.push(RawRecord{ rtype: "A".into(), data: ip.to_string()}),
+                            RData::AAAA(ip) => records.push(RawRecord{ rtype: "AAAA".into(), data: ip.to_string()}),
+                            RData::CNAME(c) => records.push(RawRecord{ rtype: "CNAME".into(), data: c.to_utf8()}),
+                            RData::TXT(txt) => records.push(RawRecord{ rtype: "TXT".into(), data: txt.to_string()}),
+                            _ => {}
+                        }
                     }
                 }
+                Ok((records, rcode))
             }
-            Ok(DnsAnswer { records, rcode })
+            Err(_) => Ok((Vec::new(), "TIMEOUT".into()))
         }
-        Err(_) => Ok(DnsAnswer { records: Vec::new(), rcode: "TIMEOUT".into() })
     }
+
+    // 1) Query A
+    let (mut records, rcode_a) = send_and_parse(domain, server, timeout_ms, RecordType::A)?;
+    let has_ip = records.iter().any(|r| r.rtype == "A" || r.rtype == "AAAA");
+    let cname_target = records.iter().find(|r| r.rtype == "CNAME").map(|r| r.data.clone());
+
+    // 2) If no IPs found, query AAAA
+    if !has_ip {
+        let (mut rec_aaaa, _rcode_aaaa) = send_and_parse(domain, server, timeout_ms, RecordType::AAAA)?;
+        if !rec_aaaa.is_empty() { records.append(&mut rec_aaaa); }
+    }
+
+    // 3) If still no IPs and have a CNAME, chase it once with A
+    let has_ip_now = records.iter().any(|r| r.rtype == "A" || r.rtype == "AAAA");
+    if !has_ip_now {
+        if let Some(cn) = cname_target {
+            if let Ok((mut rec_cname_a, _)) = send_and_parse(&cn, server, timeout_ms, RecordType::A) {
+                if !rec_cname_a.is_empty() { records.append(&mut rec_cname_a); }
+            }
+        }
+    }
+
+    Ok(DnsAnswer { records, rcode: rcode_a })
 }
 
 pub fn query_ns_names(domain: &str, server: &str, timeout_ms: u64) -> Result<Vec<String>> {

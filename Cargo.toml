@@ -1,7 +1,15 @@
 [package]
 name = "rusub"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+authors = ["AdySec <admin@adysec.com>"]
+description = "高速、智能的子域枚举工具"
+license = "MIT"
+repository = "https://github.com/adysec/rusub"
+homepage = "https://github.com/adysec/rusub"
+keywords = ["dns", "subdomain", "enumeration", "security", "recon"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
@@ -10,6 +18,7 @@ futures = "0.3"
 anyhow = "1.0"
 pcap = "0.11"
 trust-dns-proto = "0.22"
+trust-dns-resolver = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 csv = "1.1"

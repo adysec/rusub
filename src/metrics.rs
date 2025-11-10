@@ -78,7 +78,7 @@ pub fn spawn_reporter(m: Arc<Metrics>, interval_secs: u64, wide: bool, color: bo
             } else { String::new() };
 
             if legacy {
-                // Legacy condensed layout (closer to ksubdomain style)
+                // Legacy condensed layout (compact columns)
                 let pct = colorize(color, "32", format!("{:>5.1}%", percent));
                 let rat = colorize(color, "33", format!("{:.0}", rate));
                 let nx = m.nxdomain.load(Ordering::Relaxed);

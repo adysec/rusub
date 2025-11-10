@@ -49,6 +49,10 @@ pub struct Options {
     pub progress_json_file: Option<PathBuf>,
     pub progress_json_interval: u64,
     pub log_level: String,
+    pub pure_output: bool,
+    pub only_alive: bool,
+    pub heuristic: bool,
+    pub heuristic_max: usize,
 }
 
 impl Options {
@@ -56,6 +60,11 @@ impl Options {
         if self.silent {
             // placeholder for logger level - silent implies minimal stdout
         }
+        if self.pure_output {
+            // pure mode implies no progress and minimal stdout
+            self.progress = false;
+        }
+        // no extra checks for only_alive
     }
 }
 
@@ -147,17 +156,50 @@ pub fn band2rate(band: &str) -> Result<i64> {
     anyhow::bail!("invalid band format: {}", band)
 }
 
+/// 从系统配置读取 DNS 服务器（跨平台）
+fn get_system_resolvers() -> Vec<String> {
+    use trust_dns_resolver::system_conf;
+    use std::collections::HashSet;
+    
+    // 使用 trust-dns-resolver 获取系统 DNS 配置
+    // 这个方法在 Windows、Linux、macOS 上都能工作
+    match system_conf::read_system_conf() {
+        Ok((config, _opts)) => {
+            let mut seen = HashSet::new();
+            let servers: Vec<String> = config
+                .name_servers()
+                .iter()
+                .map(|ns| ns.socket_addr.ip().to_string())
+                // 过滤掉本地回环地址和 IPv6 地址
+                .filter(|s| !s.starts_with("127.") && !s.starts_with("::1") && !s.contains(':'))
+                // 去重
+                .filter(|s| seen.insert(s.clone()))
+                .collect();
+            
+            if !servers.is_empty() {
+                return servers;
+            }
+        }
+        Err(_) => {
+            // 无法获取系统配置，继续到下面的默认值
+        }
+    }
+    
+    // 如果无法读取系统配置，返回默认的公共 DNS
+    vec![
+        "1.1.1.1".into(),
+        "8.8.8.8".into(),
+    ]
+}
+
 pub fn get_resolvers(input: &Vec<String>) -> Vec<String> {
     if !input.is_empty() {
+        // 用户手动指定的 DNS 服务器
         return input.clone();
     }
-    vec![
-        "1.1.1.1".to_string(),
-        "8.8.8.8".to_string(),
-        "180.76.76.76".to_string(),
-        "180.184.1.1".to_string(),
-        "180.184.2.2".to_string(),
-    ]
+    
+    // 使用系统配置的 DNS 服务器
+    get_system_resolvers()
 }
 
 #[cfg(test)]

@@ -199,7 +199,7 @@ pub fn build_writers(path: Option<PathBuf>, output_type: &str, to_stdout: bool, 
     Ok(v)
 }
 
-// ksubdomain 风格链式输出：sub => CNAME xxx => CNAME yyy => ip => ip
+// 链式输出：sub => CNAME xxx => CNAME yyy => ip => ip
 pub struct KsWriter {
     file: Option<Mutex<Box<dyn Write + Send>>>,
     to_stdout: bool,

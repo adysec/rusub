@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use crate::rawdns;
+use crate::dns;
 use rand::seq::SliceRandom;
 
 /// Basic wildcard detection: send a few random label queries and collect any returned IPs.
@@ -13,7 +13,7 @@ pub fn detect_wildcard(domain: &str, resolvers: &Vec<String>, attempts: usize, t
         let host = format!("{}.{}", label, domain);
         // Use a random resolver each time
         if let Some(resolver) = resolvers.get(i % resolvers.len()) {
-            if let Ok(ans) = rawdns::udp_query(&host, resolver, timeout_ms) {
+            if let Ok(ans) = dns::udp_query(&host, resolver, timeout_ms) {
                 for a in ans { ips.insert(a); }
             }
         }
@@ -34,7 +34,7 @@ pub fn detect_wildcard_advanced(domain: &str, resolvers: &Vec<String>, attempts:
         let label = format!("adv{}_{}", rand::random::<u32>(), i);
         let host = format!("{}.{}", label, domain);
         if let Some(resolver) = resolvers.choose(&mut rng) {
-            if let Ok(ans) = rawdns::udp_query(&host, resolver, timeout_ms) {
+            if let Ok(ans) = dns::udp_query(&host, resolver, timeout_ms) {
                 for a in ans { *freq.entry(a).or_insert(0) += 1; }
             }
         }

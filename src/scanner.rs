@@ -9,48 +9,50 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::net::lookup_host;
 // rand was previously used for direct resolver randomization; now handled inside ResolverPool
 // (remove unused imports)
-use crate::rawdns::udp_query_full;
+use crate::dns::udp_query_full;
 use crate::output::{ScanResult, ScanRecord, build_writers};
 use crate::wildcard::{detect_wildcard, is_wildcard};
 use std::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use crate::ratelimit::RateLimiter;
-use crate::predict;
+use crate::discovery;
 use crate::metrics::{Metrics, spawn_reporter, spawn_json_reporter};
 use crate::resolver_pool::ResolverPool;
-use crate::statusdb::{StatusDb, Item, EntryState};
-use crate::statusdb_persist;
+use crate::state::{StatusDb, Item, EntryState};
 
 async fn read_wordlist(path: &Option<PathBuf>) -> Result<Vec<String>> {
-    let mut words = Vec::new();
     if let Some(p) = path {
+        let mut words = Vec::new();
         let f = File::open(p)?;
         for line in BufReader::new(f).lines() {
             if let Ok(l) = line {
-                let s = l.trim().to_string();
+                let s = l.trim();
                 if s.is_empty() || s.starts_with('#') { continue; }
-                words.push(s);
+                words.push(s.to_string());
             }
         }
+        Ok(words)
     } else {
-        // 内置默认字典（对齐 ksubdomain，编译期内嵌）
-        let embedded: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/ksubdomain/pkg/core/data/subdomain.txt"));
-        for l in embedded.lines() {
-            let s = l.trim();
-            if s.is_empty() || s.starts_with('#') { continue; }
-            words.push(s.to_string());
-        }
+        // 使用内置 dicts 模块减少 I/O
+        Ok(crate::dicts::default_wordlist())
     }
-    Ok(words)
 }
 
 pub async fn run(opt: Options) -> Result<()> {
     let mut words = read_wordlist(&opt.filename).await?;
+    
     if opt.predict {
-        let mut seeds = predict::basic_seeds();
-        let dyn_ext: Vec<String> = predict::dynamic_extend(&[], &seeds, 32);
+        let mut seeds = discovery::basic_seeds();
+        let dyn_ext: Vec<String> = discovery::dynamic_extend(&[], &seeds, 32);
         seeds.extend(dyn_ext);
         words.append(&mut seeds);
+        words.sort(); words.dedup();
+    }
+    //启发式扩展（基于现有词表和常见 token），可配置最大条数
+    if opt.heuristic {
+        let max = opt.heuristic_max.max(1);
+        let mut h = discovery::generate_heuristics(&words, max);
+        words.append(&mut h);
         words.sort(); words.dedup();
     }
     let discovered = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -66,9 +68,9 @@ pub async fn run(opt: Options) -> Result<()> {
     let status_db = StatusDb::create_memory_db();
     // load persisted status if configured
     if let Some(path) = &opt.status_file {
-        match statusdb_persist::load_from_file(&status_db, path).await {
-            Ok(n) => { if !opt.silent { eprintln!("[statusdb] loaded {} entries from {}", n, path.display()); } },
-            Err(e) => { eprintln!("[statusdb] load error: {}", e); }
+        match crate::state::load_from_file(&status_db, path).await {
+            Ok(n) => { if !opt.silent && !opt.pure_output { eprintln!("[statusdb] loaded {} entries from {}", n, path.display()); } },
+            Err(e) => { if !opt.pure_output { eprintln!("[statusdb] load error: {}", e); } }
         }
     }
     // total = words * domains (initial pass)
@@ -79,16 +81,18 @@ pub async fn run(opt: Options) -> Result<()> {
     resolver_pool.set_cooldown_secs(opt.resolver_cooldown_secs);
     let base_resolvers = opt.resolvers.clone();
     // log when a resolver gets disabled by health heuristics
-    resolver_pool.on_disable(move |addr| {
-        eprintln!("\n[resolver] disabled {}", addr);
-    });
+    if !opt.pure_output {
+        resolver_pool.on_disable(move |addr| {
+            eprintln!("\n[resolver] disabled {}", addr);
+        });
+    }
     if !opt.silent && opt.progress { spawn_reporter(metrics.clone(), opt.progress_interval, opt.progress_wide, opt.progress_color, opt.progress_legacy, Some(resolver_pool.clone())); }
     // progress json reporter
     if let (Some(path), interval) = (&opt.progress_json_file, opt.progress_json_interval) {
-        if interval > 0 { spawn_json_reporter(metrics.clone(), interval, Some(resolver_pool.clone()), path.clone()); }
+        if interval > 0 && !opt.pure_output { spawn_json_reporter(metrics.clone(), interval, Some(resolver_pool.clone()), path.clone()); }
     }
     // adaptive rate controller
-    if opt.adaptive_rate {
+    if opt.adaptive_rate && !opt.pure_output {
         let metrics_a = metrics.clone();
         let rl_a = rl.clone();
         let min_r = opt.adaptive_min_rate;
@@ -130,13 +134,14 @@ pub async fn run(opt: Options) -> Result<()> {
             let db = status_db.clone();
             let p = path.clone();
             let silent = opt.silent;
+            let pure = opt.pure_output;
             Some(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(interval));
                 loop {
                     tick.tick().await;
-                    if let Err(e) = statusdb_persist::save_to_file(&db, &p).await {
-                        eprintln!("[statusdb] periodic save error: {}", e);
-                    } else if !silent {
+                    if let Err(e) = crate::state::save_to_file(&db, &p).await {
+                        if !pure { eprintln!("[statusdb] periodic save error: {}", e); }
+                    } else if !silent && !pure {
                         eprintln!("[statusdb] periodic saved to {}", p.display());
                     }
                 }
@@ -149,6 +154,7 @@ pub async fn run(opt: Options) -> Result<()> {
         if interval > 0 {
             let pool_c = resolver_pool.clone();
             let p = path.clone();
+            let pure = opt.pure_output;
             Some(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(interval));
                 loop {
@@ -157,6 +163,7 @@ pub async fn run(opt: Options) -> Result<()> {
                     if let Ok(data) = serde_json::to_vec_pretty(&snap) {
                         let _ = tokio::fs::write(&p, data).await;
                     }
+                    if pure { continue; }
                 }
             }))
         } else { None }
@@ -175,10 +182,14 @@ pub async fn run(opt: Options) -> Result<()> {
             _ => std::collections::HashSet::new(),
         };
         for w in words.iter() {
-            let sub = w.to_string();
-            let host = format!("{}.{}", sub, domain);
+            let sub = w;
+            let mut host = String::with_capacity(sub.len() + 1 + domain.len());
+            host.push_str(sub);
+            host.push('.');
+            host.push_str(&domain);
             let permit = sem.clone().acquire_owned().await.unwrap();
-            let show_all = !opt.not_print;
+            // show_all: 是否输出失败/空/NXDOMAIN；only_alive=true 时仅输出有记录成功项
+            let show_all = !opt.not_print && !opt.only_alive;
 
                 let writers = writers.clone();
             let pool_local = resolver_pool.clone();
@@ -191,6 +202,7 @@ pub async fn run(opt: Options) -> Result<()> {
                 let _p = permit;
                 let mut attempt = 0i32;
                 let mut success = false;
+                let smart_protect = opt.retry == 0; // --retry 0 时，临时错误智能补偿一次
                 // cache check: skip if already known OK or wildcard
                 if let Some(it) = status_db_task.get(&host).await {
                     if it.state == EntryState::Ok || it.state == EntryState::WildFiltered {
@@ -198,7 +210,7 @@ pub async fn run(opt: Options) -> Result<()> {
                         return;
                     }
                 }
-                while opt.retry < 0 || attempt <= opt.retry {
+                while opt.retry < 0 || attempt <= opt.retry || (smart_protect && attempt < 2) {
                     attempt += 1;
                     // 速率控制: 消耗一个令牌
                     // 每个查询消耗一个令牌 (Semaphore 单次 acquire)
@@ -277,11 +289,13 @@ pub async fn run(opt: Options) -> Result<()> {
                             _ => {}
                         }
                     }
-                    if opt.retry >= 0 && attempt > opt.retry { break; }
+                    if opt.retry >= 0 && attempt > opt.retry {
+                        if smart_protect && attempt == 1 { continue; } else { break; }
+                    }
                 }
                 if !success && show_all {
                     let res = ScanResult { subdomain: host.clone(), answers: vec![], records: None };
-                        for ow in writers.iter() { let _ = ow.write(&res); }
+                    for ow in writers.iter() { let _ = ow.write(&res); }
                     metrics_task.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let item = Item { domain: host.clone(), dns: "".into(), time: std::time::SystemTime::now(), retry: attempt as i32, domain_level: 0, state: EntryState::Failed };
                     status_db_task.set(host.clone(), item).await;
@@ -299,8 +313,8 @@ pub async fn run(opt: Options) -> Result<()> {
         for _round in 0..opt.predict_rounds {
             let snapshot = discovered.lock().unwrap().clone();
             if snapshot.is_empty() { break; }
-            let base = predict::basic_seeds();
-            let mut new_seeds = predict::dynamic_extend(&snapshot, &base, opt.predict_topn.max(1));
+            let base = discovery::basic_seeds();
+            let mut new_seeds = discovery::dynamic_extend(&snapshot, &base, opt.predict_topn.max(1));
             new_seeds.retain(|s| !word_set.lock().unwrap().contains(s));
             if new_seeds.is_empty() { break; }
             let additional = (new_seeds.len() as u64) * (opt.domains.len() as u64);
@@ -314,9 +328,12 @@ pub async fn run(opt: Options) -> Result<()> {
                 };
                 for s in new_seeds.iter() {
                     word_set.lock().unwrap().insert(s.clone());
-                    let host = format!("{}.{}", s, domain);
+                    let mut host = String::with_capacity(s.len() + 1 + domain.len());
+                    host.push_str(s);
+                    host.push('.');
+                    host.push_str(&domain);
                     let permit = sem.clone().acquire_owned().await.unwrap();
-                    let show_all = !opt.not_print;
+                    let show_all = !opt.not_print && !opt.only_alive;
                     let writers = writers.clone();
                     let pool_local = resolver_pool.clone();
                     let status_db_task = status_db.clone();
@@ -328,13 +345,14 @@ pub async fn run(opt: Options) -> Result<()> {
                         let _p = permit;
                         let mut attempt = 0i32;
                         let mut success = false;
+                        let smart_protect = opt.retry == 0; // 预测阶段同样启用智能补偿
                         if let Some(it) = status_db_task.get(&host).await {
                             if it.state == EntryState::Ok || it.state == EntryState::WildFiltered {
                                 metrics_task.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }
                         }
-                        while opt.retry < 0 || attempt <= opt.retry {
+                        while opt.retry < 0 || attempt <= opt.retry || (smart_protect && attempt < 2) {
                             attempt += 1;
                             let _rp = rl_sem_task.clone().acquire_owned().await.unwrap();
                             metrics_task.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -383,7 +401,9 @@ pub async fn run(opt: Options) -> Result<()> {
                                     _ => { pool_local.report_fail(&resolver); }
                                 }
                             }
-                            if opt.retry >= 0 && attempt > opt.retry { break; }
+                            if opt.retry >= 0 && attempt > opt.retry {
+                                if smart_protect && attempt == 1 { continue; } else { break; }
+                            }
                         }
                         if !success && show_all {
                             let res = ScanResult { subdomain: host.clone(), answers: vec![], records: None };
@@ -406,14 +426,14 @@ pub async fn run(opt: Options) -> Result<()> {
 
     // final flush
     if let Some(path) = &opt.status_file {
-        if let Err(e) = statusdb_persist::save_to_file(&status_db, path).await {
-            eprintln!("[statusdb] final save error: {}", e);
+        if let Err(e) = crate::state::save_to_file(&status_db, path).await {
+            if !opt.pure_output { eprintln!("[statusdb] final save error: {}", e); }
         }
     }
     // final resolver stats output
     if let Some(path) = &opt.resolver_stats_file {
         if let Err(e) = tokio::fs::write(path, serde_json::to_vec_pretty(&resolver_pool.snapshot()).unwrap_or_default()).await {
-            eprintln!("[resolver] write stats error: {}", e);
+            if !opt.pure_output { eprintln!("[resolver] write stats error: {}", e); }
         }
     }
     // final progress json output (single snapshot) if configured
@@ -470,7 +490,7 @@ pub async fn run(opt: Options) -> Result<()> {
             error_rate_total: err_total,
         };
         if let Ok(data) = serde_json::to_vec_pretty(&snap) {
-            if let Err(e) = tokio::fs::write(path, data).await { eprintln!("[progress] write final json error: {}", e); }
+            if let Err(e) = tokio::fs::write(path, data).await { if !opt.pure_output { eprintln!("[progress] write final json error: {}", e); } }
         }
     }
     // cancel periodic task (drop by abort)
